@@ -116,6 +116,7 @@ namespace System.Net.Sockets.Kcp
 
         /// <summary>
         /// offset = 12
+        /// 已发送次数？
         /// </summary>
         public uint xmit
         {

@@ -1,6 +1,7 @@
 ﻿using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using static System.Math;
 using BufferOwner = System.Buffers.IMemoryOwner<byte>;
@@ -20,7 +21,7 @@ namespace System.Net.Sockets.Kcp
         mtu 最大传输单元
         mss 最大分片大小
         state 连接状态（0xFFFFFFFF表示断开连接）
-        snd_una 第一个未确认的包
+        snd_una 第一个未确认的包 send unarrived
         snd_nxt 待发送包的序号
         rcv_nxt 待接收消息序号
         ssthresh 拥塞窗口阈值
@@ -31,7 +32,7 @@ namespace System.Net.Sockets.Kcp
         snd_wnd 发送窗口大小
         rcv_wnd 接收窗口大小
         rmt_wnd,	远端接收窗口大小
-        cwnd, 拥塞窗口大小
+        cwnd, 拥塞窗口大小 congestion(拥塞) window
         probe 探查变量，IKCP_ASK_TELL表示告知远端窗口大小。IKCP_ASK_SEND表示请求远端告知窗口大小
         interval    内部flush刷新间隔
         ts_flush 下次flush刷新时间戳
@@ -397,14 +398,14 @@ namespace System.Net.Sockets.Kcp
             }
 
             var peekSize = -1;
-            var seq = rcv_queue[0];
+            var seg = rcv_queue[0];
 
-            if (seq.frg == 0)
+            if (seg.frg == 0)
             {
-                peekSize = (int)seq.len;
+                peekSize = (int)seg.len;
             }
 
-            if (rcv_queue.Count < seq.frg + 1)
+            if (rcv_queue.Count < seg.frg + 1)
             {
                 ///没有足够的包
                 return (null, -1);
@@ -437,6 +438,7 @@ namespace System.Net.Sockets.Kcp
         }
     }
 
+    // KCP主要接口实现
     public partial class Kcp
     {
         static uint Ibound(uint lower, uint middle, uint upper)
@@ -449,6 +451,7 @@ namespace System.Net.Sockets.Kcp
             return ((int)(later - earlier));
         }
 
+        #region 上层recv
         /// <summary>
         /// user/upper level recv: returns size, returns below zero for EAGAIN
         /// </summary>
@@ -495,6 +498,7 @@ namespace System.Net.Sockets.Kcp
             /// merge fragment.
 
             var recvLength = 0;
+            // @todo 感觉锁的时间太长了吧
             lock (rcv_queueLock)
             {
                 var count = 0;
@@ -506,7 +510,7 @@ namespace System.Net.Sockets.Kcp
                     count++;
                     int frg = seg.frg;
 
-                    KcpSegment.FreeHGlobal(seg);
+                    KcpSegment.FreeHGlobal(seg); // 确定不做个对象池什么的？
                     if (frg == 0)
                     {
                         break;
@@ -589,6 +593,7 @@ namespace System.Net.Sockets.Kcp
                 return -1;
             }
 
+            // @todo lock 应该可以用自旋锁优化
             lock (rcv_queueLock)
             {
                 uint length = 0;
@@ -605,6 +610,7 @@ namespace System.Net.Sockets.Kcp
                 return (int)length;
             }
         }
+        #endregion
 
         /// <summary>
         /// user/upper level send, returns below zero for error
@@ -619,18 +625,14 @@ namespace System.Net.Sockets.Kcp
                 return -4;
             }
 
-            if (mss <= 0)
-            {
-                throw new InvalidOperationException($" mss <= 0 ");
-            }
-
+            checkMSS();
 
             if (buffer.Length == 0)
             {
                 return -1;
             }
             var offset = 0;
-            var count = 0;
+            var count = 0; // 分片数量 
 
             #region append to previous segment in streaming mode (if possible)
             /// 基于线程安全和数据结构的等原因,移除了追加数据到最后一个包行为。
@@ -652,11 +654,6 @@ namespace System.Net.Sockets.Kcp
                 return -2;
             }
 
-            if (count == 0)
-            {
-                count = 1;
-            }
-
             for (var i = 0; i < count; i++)
             {
                 var size = 0;
@@ -672,7 +669,7 @@ namespace System.Net.Sockets.Kcp
                 var seg = KcpSegment.AllocHGlobal(size);
                 buffer.Slice(offset, size).CopyTo(seg.data);
                 offset += size;
-                seg.frg = (byte)(count - i - 1);
+                seg.frg = (byte)(count - i - 1); // 分片编号？怎么是倒着来的？是为了方便检查最后一个分片
                 snd_queue.Enqueue(seg);
             }
 
@@ -716,6 +713,7 @@ namespace System.Net.Sockets.Kcp
             rx_rto = Ibound(rx_minrto, rto, IKCP_RTO_MAX);
         }
 
+        // 更新最大未到达发送包编号
         void Shrink_buf()
         {
             lock (snd_bufLock)
@@ -773,6 +771,7 @@ namespace System.Net.Sockets.Kcp
 
         }
 
+        //  设置快速重传检查参数
         void Parse_fastack(uint sn)
         {
             if (Itimediff(sn, snd_una) < 0 || Itimediff(sn, snd_nxt) >= 0)
@@ -785,6 +784,7 @@ namespace System.Net.Sockets.Kcp
                 foreach (var item in snd_buf)
                 {
                     var seg = item;
+
                     if (Itimediff(sn, seg.sn) < 0)
                     {
                         break;
@@ -797,9 +797,10 @@ namespace System.Net.Sockets.Kcp
             }
         }
 
+        // 收到了新的分片，放入recv_buf，并更新recv_queue
         void Parse_data(KcpSegment newseg)
         {
-            var sn = newseg.sn;
+            uint sn = newseg.sn;
 
             lock (rcv_bufLock)
             {
@@ -851,6 +852,9 @@ namespace System.Net.Sockets.Kcp
 
         /// <summary>
         /// when you received a low level packet (eg. UDP packet), call it
+        /// 1、解析KCP包4大命令：ACK，数据包，请求我的接收窗口，对方的接收窗口（每个KCP包都带了）
+        /// 2、设置快速重传的检查参数（已发送包被跳过确认的次数）
+        /// 3、处理拥塞窗口
         /// </summary>
         /// <param name="data"></param>
         /// <returns></returns>
@@ -864,20 +868,20 @@ namespace System.Net.Sockets.Kcp
 
             uint temp_una = snd_una;
 
-            if (data.Length < IKCP_OVERHEAD)
+            if (data.Length < IKCP_OVERHEAD) // KCP最小额外开销24？
             {
                 return -1;
             }
 
             var offset = 0;
-            int flag = 0;
-            uint maxack = 0;
+            int flag = 0; // 用于maxack的初始化
+            uint maxack = 0; // 本次确认到达的最大发送包编号
             while (true)
             {
                 uint ts = 0;
                 uint sn = 0;
                 uint length = 0;
-                uint una = 0;
+                uint una = 0; // unarrive?最小的还未到达的包
                 uint conv_ = 0;
                 ushort wnd = 0;
                 byte cmd = 0;
@@ -959,7 +963,7 @@ namespace System.Net.Sockets.Kcp
                 }
 
                 rmt_wnd = wnd;
-                Parse_una(una);
+                Parse_una(una); // KCP总是带una字段的，所以可以快速批量确认已到达的包
                 Shrink_buf();
 
                 if (IKCP_CMD_ACK == cmd)
@@ -968,7 +972,7 @@ namespace System.Net.Sockets.Kcp
                     {
                         Update_ack(Itimediff(current, ts));
                     }
-                    Parse_ack(sn);
+                    Parse_ack(sn); // 选择确认
                     Shrink_buf();
 
                     if (flag == 0)
@@ -987,6 +991,7 @@ namespace System.Net.Sockets.Kcp
                     if (Itimediff(sn, rcv_nxt + rcv_wnd) < 0)
                     {
                         ///instead of ikcp_ack_push
+                        ///收到数据包了，要在Flush时回发ACK包
                         acklist.Enqueue((sn, ts));
 
                         if (Itimediff(sn, rcv_nxt) >= 0)
@@ -1037,7 +1042,7 @@ namespace System.Net.Sockets.Kcp
             {
                 if (cwnd < rmt_wnd)
                 {
-                    var mss_ = mss;
+                    uint mss_ = mss;
                     if (cwnd < ssthresh)
                     {
                         cwnd++;
@@ -1055,6 +1060,7 @@ namespace System.Net.Sockets.Kcp
                             cwnd++;
                         }
                     }
+                    // 以下的判断没有用吧？
                     if (cwnd > rmt_wnd)
                     {
                         cwnd = rmt_wnd;
@@ -1089,8 +1095,8 @@ namespace System.Net.Sockets.Kcp
         {
             var current_ = current;
             var buffer_ = buffer;
-            var change = 0;
-            var lost = 0;
+            var change = 0; // > 0 发生了快速重传
+            var lost = 0; // == 1 发生了超时重传
             var offset = 0;
 
             if (updated == 0)
@@ -1211,7 +1217,7 @@ namespace System.Net.Sockets.Kcp
             #region 刷新，将发送等待列表移动到发送列表
 
             // calculate window size
-            var cwnd_ = Min(snd_wnd, rmt_wnd);
+            uint cwnd_ = Min(snd_wnd, rmt_wnd);
             if (nocwnd == 0)
             {
                 cwnd_ = Min(cwnd, cwnd_);
@@ -1219,7 +1225,7 @@ namespace System.Net.Sockets.Kcp
 
             while (Itimediff(snd_nxt, snd_una + cwnd_) < 0)
             {
-                if (snd_queue.TryDequeue(out var newseg))
+                if (snd_queue.TryDequeue(out KcpSegment newseg))
                 {
                     newseg.conv = conv;
                     newseg.cmd = IKCP_CMD_PUSH;
@@ -1260,14 +1266,14 @@ namespace System.Net.Sockets.Kcp
                     var needsend = false;
                     var debug = Itimediff(current_, segment.resendts);
                     if (segment.xmit == 0)
-                    {
+                    { // 首次发送
                         needsend = true;
                         segment.xmit++;
                         segment.rto = rx_rto;
                         segment.resendts = current_ + rx_rto + rtomin;
                     }
                     else if (Itimediff(current_, segment.resendts) >= 0)
-                    {
+                    { // 超时重传
                         needsend = true;
                         segment.xmit++;
                         this.xmit++;
@@ -1284,7 +1290,7 @@ namespace System.Net.Sockets.Kcp
                         lost = 1;
                     }
                     else if (segment.fastack >= resent)
-                    {
+                    { // 快速重传
                         needsend = true;
                         segment.xmit++;
                         segment.fastack = 0;
@@ -1310,7 +1316,7 @@ namespace System.Net.Sockets.Kcp
 
                         if (segment.xmit >= dead_link)
                         {
-                            state = -1;
+                            state = -1; // 起过最大重传次数，断线了
                         }
                     }
                 }
@@ -1329,6 +1335,7 @@ namespace System.Net.Sockets.Kcp
 
             #region update ssthresh
             // update ssthresh
+            // 发生快速重传和超时重传所用的拥塞控制算法是不一样的
             if (change != 0)
             {
                 var inflight = snd_nxt - snd_una;
@@ -1343,7 +1350,7 @@ namespace System.Net.Sockets.Kcp
             }
 
             if (lost != 0)
-            {
+            { // 网络很不好了，拥塞窗口为1
                 ssthresh = cwnd / 2;
                 if (ssthresh < IKCP_THRESH_MIN)
                 {
@@ -1379,7 +1386,7 @@ namespace System.Net.Sockets.Kcp
             current = time.ConvertTime();
 
             if (updated == 0)
-            {
+            { // 首次Update
                 updated = 1;
                 ts_flush = current;
             }
@@ -1576,6 +1583,15 @@ namespace System.Net.Sockets.Kcp
         /// </summary>
         /// <returns></returns>
         public int WaitSnd => snd_buf.Count + snd_queue.Count;
+
+        [Conditional("Debug")]
+        void checkMSS()
+        {
+            if (mss <= 0)
+            {
+                throw new InvalidOperationException($" mss <= 0 ");
+            }
+        }
     }
 
     public static class KcpExtension_FDF71D0BC31D49C48EEA8FAA51F017D4
